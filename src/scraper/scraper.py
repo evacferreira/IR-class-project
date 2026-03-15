@@ -121,7 +121,7 @@ def find_chrome_executable():
 
 
 class UMinhoDSpace8Scraper:
-    def __init__(self, base_url, max_items=10):
+    def __init__(self, base_url, max_items=50):
         """
         Initialize the web scraper with Selenium WebDriver configuration.
         Args:
@@ -158,11 +158,22 @@ class UMinhoDSpace8Scraper:
     def get_paper_info(self, url):
         """
         Given a paper URL, navigates to it and extracts metadata from the table.
+        
+        Args:
+            url (str): The URL of the specific paper's full metadata view.
+            
+        Returns:
+            dict: A dictionary containing the mapped Dublin Core metadata fields.
         """
+        # Navigate to the document's full metadata page
+        # The URL is used as the unique document ID in the system
         self.driver.get(url)
-        # Wait for the table to appear
+        
+        # Wait until the metadata table is rendered by the Angular frontend
         self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.table-striped")))
-        time.sleep(self.ANGULAR_SETTLE_TIME) # Angular settle time
+        
+        # Brief pause to ensure all dynamic elements are fully settled
+        time.sleep(self.ANGULAR_SETTLE_TIME)
 
         # Dictionary to store the mapping we want
         # This is our "Shopping List" - Key: what the HTML says, Value: what we want in our JSON
@@ -171,37 +182,45 @@ class UMinhoDSpace8Scraper:
             "dc.date.issued": "year",
             "dc.identifier.doi": "doi",
             "dc.contributor.author": "authors",
-            "dc.description.abstract": "abstract"
+            "dc.description.abstract": "abstract",
+            "dc.identifier.uri": "url"  # Crucial for the indexer to link words back to the source
         }
 
-        data = { "title": "N/A", "year": "N/A", "doi": "N/A", "abstract": "N/A", "authors": [] }
+        # Initialize the data structure with default values
+        data = { 
+            "title": "N/A", 
+            "year": "N/A", 
+            "doi": "N/A", 
+            "abstract": "N/A", 
+            "authors": [], 
+            "url": url.replace('/full', ''), # Fallback URL in case dc.identifier.uri is missing
+        }
 
         try:
             # Locate all rows in the metadata table
             rows = self.driver.find_elements(By.CSS_SELECTOR, "table.table-striped tbody tr")
-
+            
             for row in rows:
+                # In DSpace 8, metadata is usually structured in two columns: Label and Value
                 cols = row.find_elements(By.TAG_NAME, "td")
+                
                 if len(cols) >= 2:
                     field_label = cols[0].text.strip()
                     field_value = cols[1].text.strip()
 
+                    # Check if the current field label is one of our required targets
                     if field_label in targets:
                         key = targets[field_label]
+                        
+                        # Handle multiple authors (append to list) vs singular fields (overwrite)
                         if key == "authors":
                             data[key].append(field_value)
                         else:
                             data[key] = field_value
 
-            # Attempt to find the document link (if available)
-            docLink = self.driver.find_elements(By.CSS_SELECTOR, "a.btn.overflow-ellipsis.mb-1[title^='Download:']")
-            if docLink:
-                data["document_link"] = docLink[0].get_attribute("href")
-            else:
-                data["document_link"] = "N/A"
-
         except Exception as e:
-            print(f"Error parsing table: {e}")
+            # Catch and log any parsing errors without crashing the entire scraping process
+            print(f"Error parsing metadata for {url}: {e}")
 
         return data
 

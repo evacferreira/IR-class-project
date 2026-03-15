@@ -1,5 +1,5 @@
 import json
-import scraper
+import src.scraper.scraper as scraper
 
 def main():
     # Example collection:  https://repositorium.uminho.pt/collections/690f7814-a67b-4f27-8fff-6b33581d1a91/search
@@ -16,7 +16,7 @@ def main():
     print(f"Scraping completed. Total papers scraped: {len(final_results)}")
 
     # Save results to a JSON file
-    with open('scraper_results.json', 'w', encoding='utf-8') as f:
+    with open('data/scraper_results.json', 'w', encoding='utf-8') as f:
         json.dump(final_results, f, ensure_ascii=False, indent=4)
 
     print(f"Done! {len(final_results)} items saved.")
