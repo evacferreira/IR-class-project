@@ -121,7 +121,7 @@ def find_chrome_executable():
 
 
 class UMinhoDSpace8Scraper:
-    def __init__(self, base_url, max_items=50):
+    def __init__(self, base_url, max_items=20):
         """
         Initialize the web scraper with Selenium WebDriver configuration.
         Args:
@@ -339,3 +339,18 @@ class UMinhoDSpace8Scraper:
             self.driver.quit()
 
         return results
+
+if __name__ == "__main__":
+    import json
+    import os
+
+    BASE_URL = "https://repositorium.uminho.pt/search?f.entityType=Publication,equals"  # o teu URL
+
+    scraper = UMinhoDSpace8Scraper(base_url=BASE_URL, max_items=50)
+    results = scraper.scrape()
+
+    os.makedirs("data", exist_ok=True)
+    with open("data/scraper_results.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
+
+    print(f"Guardados {len(results)} documentos.")
