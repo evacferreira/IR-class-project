@@ -121,17 +121,25 @@ def find_chrome_executable():
 
 
 class UMinhoDSpace8Scraper:
-    def __init__(self, base_url, max_items=20):
+    def __init__(self, base_url, max_items=20, research_area=None):
         """
         Initialize the web scraper with Selenium WebDriver configuration.
         Args:
             base_url (str): The base URL of the website to scrape.
-            max_items (int, optional): Maximum number of items to scrape. Defaults to 10.
+            max_items (int, optional): Maximum number of items to scrape. Defaults to 20.
+            research_area (str, optional): Filter by research area/subject (REQ-B08).
+                Appended as a query parameter, e.g. 'machine learning'.
         Note:
             Automatically detects Chrome in default installation locations on Windows and Linux.
             If you don't have Chrome, you can download a portable version from:
             https://googlechromelabs.github.io/chrome-for-testing/#stable
         """
+        # REQ-B08: Append research area filter to the base URL if provided
+        if research_area:
+            separator = "&" if "?" in base_url else "?"
+            base_url = f"{base_url}{separator}query={research_area.replace(' ', '+')}"
+            print(f"[REQ-B08] Filtering by research area: '{research_area}'")
+
         self.base_url = base_url
         chrome_options = Options()
 
@@ -183,7 +191,8 @@ class UMinhoDSpace8Scraper:
             "dc.identifier.doi": "doi",
             "dc.contributor.author": "authors",
             "dc.description.abstract": "abstract",
-            "dc.identifier.uri": "url"  # Crucial for the indexer to link words back to the source
+            "dc.identifier.uri": "url",          # Crucial for the indexer to link words back to the source
+            "dc.contributor.affiliation": "affiliations",  # REQ-B05: author affiliations
         }
 
         # Initialize the data structure with default values
@@ -193,6 +202,8 @@ class UMinhoDSpace8Scraper:
             "doi": "N/A", 
             "abstract": "N/A", 
             "authors": [], 
+            "affiliations": [],   # REQ-B05
+            "pdf_link": None,     # REQ-B04
             "url": url.replace('/full', ''), # Fallback URL in case dc.identifier.uri is missing
         }
 
@@ -212,8 +223,8 @@ class UMinhoDSpace8Scraper:
                     if field_label in targets:
                         key = targets[field_label]
                         
-                        # Handle multiple authors (append to list) vs singular fields (overwrite)
-                        if key == "authors":
+                        # Handle multiple authors/affiliations (append to list) vs singular fields (overwrite)
+                        if key in ("authors", "affiliations"):
                             data[key].append(field_value)
                         else:
                             data[key] = field_value
@@ -221,6 +232,13 @@ class UMinhoDSpace8Scraper:
         except Exception as e:
             # Catch and log any parsing errors without crashing the entire scraping process
             print(f"Error parsing metadata for {url}: {e}")
+
+        # REQ-B04: Extract PDF download link from the page
+        try:
+            pdf_elem = self.driver.find_element(By.CSS_SELECTOR, "a[href*='.pdf'], a[href*='/bitstream/']")
+            data["pdf_link"] = pdf_elem.get_attribute("href")
+        except NoSuchElementException:
+            pass  # No PDF link found, keep None
 
         return data
 
@@ -344,9 +362,12 @@ if __name__ == "__main__":
     import json
     import os
 
-    BASE_URL = "https://repositorium.uminho.pt/search?f.entityType=Publication,equals"  # o teu URL
+    BASE_URL = "https://repositorium.uminho.pt/search?f.entityType=Publication,equals"
 
-    scraper = UMinhoDSpace8Scraper(base_url=BASE_URL, max_items=20)
+    # REQ-B08: Optionally filter by research area (set to None to disable)
+    RESEARCH_AREA = "health"  # e.g. "machine learning" or "health"
+
+    scraper = UMinhoDSpace8Scraper(base_url=BASE_URL, max_items=20, research_area=RESEARCH_AREA)
     results = scraper.scrape()
 
     os.makedirs("data", exist_ok=True)

@@ -35,7 +35,9 @@ def init_db():
             doi         TEXT,
             year        TEXT,
             raw_text    TEXT,       -- REQ-B10: raw title + abstract
-            processed   TEXT        -- REQ-B10: JSON list of tokens after NLP
+            processed   TEXT,       -- REQ-B10: JSON list of tokens after NLP
+            pdf_link    TEXT,       -- REQ-B04
+            affiliations TEXT       -- REQ-B05: JSON list of affiliations
         )
     """)
 
@@ -91,6 +93,8 @@ def insert_publications(publications: list, processed_map: dict = None):
         raw_text = f"{pub.get('title', '')} {pub.get('abstract', '')}"
         processed = json.dumps(processed_map.get(url, [])) if processed_map else None
 
+        affiliations = pub.get("affiliations", [])
+
         # Insert document (skip if already exists)
         cur.execute("""
             INSERT OR IGNORE INTO documents (url, title, abstract, doi, year, raw_text, processed)
@@ -103,6 +107,8 @@ def insert_publications(publications: list, processed_map: dict = None):
             pub.get("year"),
             raw_text,
             processed,
+            pub.get("pdf_link"),
+            json.dumps(affiliations),
         ))
 
         if cur.rowcount == 0:
@@ -249,5 +255,9 @@ def get_publications_by_author(name: str) -> list:
 
 
 if __name__ == "__main__":
+    import json
     init_db()
-    print("[DB] Ready at", DB_PATH)
+    with open("data/scraper_results.json", "r", encoding="utf-8") as f:
+        publications = json.load(f)
+    insert_publications(publications)
+    print("[DB] Done.")

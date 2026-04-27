@@ -1,11 +1,13 @@
 import json
 import os
+import numpy as np
 from src.search.nlp import preprocess
 
 def build_index(json_path='data/scraper_results.json', output_path='data/index.json'):
     """
     Builds or updates an inverted index with incremental support and sorted postings.
     Supports incremental updates and stores term/doc frequencies.
+    Also builds and persists the term-document matrix (REQ-B24).
     """
     print(f"--- Starting Indexer ---")
     
@@ -82,6 +84,9 @@ def build_index(json_path='data/scraper_results.json', output_path='data/index.j
     print(f"Success! {new_docs_count} new documents added to the index.")
     print(f"Final index saved at: {output_path}")
 
+    # REQ-B24 — Build and persist the Term-Document Matrix
+    build_term_document_matrix(inverted_index, output_dir=os.path.dirname(output_path))
+
     from src.database import init_db, insert_publications, save_index
 
     init_db()
@@ -90,3 +95,80 @@ def build_index(json_path='data/scraper_results.json', output_path='data/index.j
 
 if __name__ == "__main__":
     build_index()
+
+
+# ---------------------------------------------------------------------------
+# REQ-B24 — Term-Document Matrix
+# ---------------------------------------------------------------------------
+
+def build_term_document_matrix(
+    inverted_index: dict,
+    output_dir: str = 'data',
+) -> dict:
+    """
+    Builds a Term-Document Matrix from an existing inverted index and persists
+    it to disk as a JSON file.
+
+    The matrix maps every term to an ordered vector of raw TF values across
+    all documents in the corpus.  The document order is fixed (sorted URLs)
+    so that column indices are stable and reproducible.
+
+    Structure of the saved JSON
+    ---------------------------
+    {
+        "doc_ids": ["url_0", "url_1", ...],          # ordered column labels
+        "matrix": {
+            "term_a": [tf_url0, tf_url1, ...],
+            "term_b": [tf_url0, tf_url1, ...],
+            ...
+        }
+    }
+
+    Args:
+        inverted_index: The in-memory inverted index produced by build_index().
+        output_dir:     Directory where ``term_document_matrix.json`` is saved.
+
+    Returns:
+        A dict with keys ``doc_ids`` and ``matrix`` (same shape as the JSON).
+    """
+    # Collect and sort all document IDs for a stable column ordering
+    all_doc_ids = sorted({
+        url
+        for entry in inverted_index.values()
+        for url in entry["postings"]
+    })
+
+    doc_index = {url: idx for idx, url in enumerate(all_doc_ids)}
+    n_docs = len(all_doc_ids)
+
+    matrix = {}
+    for term, entry in inverted_index.items():
+        # Initialise the full row with zeros
+        row = [0] * n_docs
+        for url, tf in entry["postings"].items():
+            row[doc_index[url]] = tf
+        matrix[term] = row
+
+    result = {"doc_ids": all_doc_ids, "matrix": matrix}
+
+    # Persist to disk
+    os.makedirs(output_dir, exist_ok=True)
+    matrix_path = os.path.join(output_dir, "term_document_matrix.json")
+    with open(matrix_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    print(f"[REQ-B24] Term-document matrix saved: {len(matrix)} terms × {n_docs} docs → {matrix_path}")
+    return result
+
+
+def load_term_document_matrix(matrix_path: str = 'data/term_document_matrix.json') -> tuple[list, dict]:
+    """
+    Loads the persisted term-document matrix from disk.
+
+    Returns:
+        (doc_ids, matrix) where doc_ids is the ordered list of URLs and
+        matrix is a dict mapping each term to its TF row vector.
+    """
+    with open(matrix_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data["doc_ids"], data["matrix"]
