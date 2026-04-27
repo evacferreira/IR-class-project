@@ -4,8 +4,9 @@ Universidade do Minho — Pesquisa e Recuperação de Informação
 """
 
 import json
-import math
 import os
+import re
+import unicodedata
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Query
@@ -80,6 +81,8 @@ class PublicationResult(BaseModel):
     title: Optional[str] = None
     authors: Optional[List[str]] = None
     abstract: Optional[str] = None
+    # REQ-B50: snippet with highlighted query terms (HTML <mark> tags)
+    snippet: Optional[str] = None
     date: Optional[str] = None
     doi: Optional[str] = None
     pdf_link: Optional[str] = None
@@ -101,20 +104,203 @@ class AuthorProfile(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# REQ-B66 — Query sanitization
+# ---------------------------------------------------------------------------
+
+# Characters that have no place in a free-text or boolean query
+_FORBIDDEN_PATTERN = re.compile(r"[<>{}\[\]\\|`~@#$%^*]")
+
+# Collapse runs of the same boolean operator (e.g. "AND AND") to one
+_REPEATED_OPERATOR = re.compile(
+    r"\b(AND|OR|NOT)\b(?:\s+\b(?:AND|OR|NOT)\b)+", re.IGNORECASE
+)
+
+# Maximum accepted query length (characters)
+_MAX_QUERY_LEN = 512
+
+
+def sanitize_query(raw: str) -> str:
+    """
+    REQ-B66 — Advanced query sanitization:
+
+    1. Reject (raise 400) if the query exceeds ``_MAX_QUERY_LEN`` characters.
+    2. Strip leading / trailing whitespace.
+    3. Normalise Unicode to NFC so accented characters are consistent.
+    4. Remove characters that are forbidden in a search context
+       (angle brackets, curly / square brackets, back-slash, pipe, back-tick,
+        and other shell / injection meta-characters).
+    5. Collapse multiple consecutive whitespace into a single space.
+    6. Collapse repeated boolean operators (e.g. ``AND AND``) to a single one.
+    7. Reject (raise 400) if the sanitized query is empty.
+
+    Returns the cleaned query string.
+    """
+    if len(raw) > _MAX_QUERY_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Query too long: {len(raw)} characters "
+                f"(maximum allowed: {_MAX_QUERY_LEN})."
+            ),
+        )
+
+    q = raw.strip()
+
+    # Normalise Unicode (NFC: composed form)
+    q = unicodedata.normalize("NFC", q)
+
+    # Strip forbidden meta-characters
+    q = _FORBIDDEN_PATTERN.sub(" ", q)
+
+    # Collapse whitespace
+    q = re.sub(r"\s+", " ", q).strip()
+
+    # Collapse repeated boolean operators: "AND AND" → "AND"
+    q = _REPEATED_OPERATOR.sub(lambda m: m.group(1).upper(), q)
+
+    # Strip dangling leading/trailing operators
+    q = re.sub(r"^(AND|OR|NOT)\s+", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+(AND|OR|NOT)$", "", q, flags=re.IGNORECASE)
+
+    q = q.strip()
+    if not q:
+        raise HTTPException(
+            status_code=400,
+            detail="Query is empty after sanitization. Please provide a valid search term.",
+        )
+
+    return q
+
+
+# ---------------------------------------------------------------------------
+# REQ-B50 — Snippet generation with term highlighting
+# ---------------------------------------------------------------------------
+
+_SNIPPET_WINDOW = 40   # words on each side of the best-matching sentence
+_SNIPPET_MAX_CHARS = 300  # hard cap on final snippet length
+
+
+def _extract_snippet(text: str, query_tokens: List[str]) -> Optional[str]:
+    """
+    REQ-B50 — Generate a short, relevant snippet from *text* that:
+
+    * Selects the sentence (or word window) with the highest density of
+      query-term matches.
+    * Wraps every matched term in ``<mark>…</mark>`` for front-end highlighting.
+    * Falls back to the first ``_SNIPPET_MAX_CHARS`` characters when no match
+      is found.
+
+    ``query_tokens`` should be the preprocessed (stemmed/lowercased) terms so
+    they align with how the index was built. We also do a raw case-insensitive
+    match against the original surface forms so the snippet stays readable.
+    """
+    if not text:
+        return None
+
+    # Build a regex that matches any of the query tokens (surface form, since
+    # the abstract is not preprocessed).  We try both the raw token and its
+    # unstemmed version by just doing a prefix match (word-boundary aware).
+    if not query_tokens:
+        # No tokens → return the start of the abstract
+        snippet = text[:_SNIPPET_MAX_CHARS]
+        return snippet + ("…" if len(text) > _SNIPPET_MAX_CHARS else "")
+
+    # Pattern matches any query token at a word boundary (case-insensitive)
+    token_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(t) for t in query_tokens) + r")\b",
+        re.IGNORECASE,
+    )
+
+    # Split into sentences (simple heuristic)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+
+    best_sentence_idx = 0
+    best_count = -1
+    for i, sent in enumerate(sentences):
+        count = len(token_pattern.findall(sent))
+        if count > best_count:
+            best_count = count
+            best_sentence_idx = i
+
+    # Take a window of sentences centred on the best one
+    start = max(0, best_sentence_idx - 1)
+    end = min(len(sentences), best_sentence_idx + 2)
+    window_text = " ".join(sentences[start:end])
+
+    # Truncate to character limit (cut at word boundary)
+    if len(window_text) > _SNIPPET_MAX_CHARS:
+        window_text = window_text[:_SNIPPET_MAX_CHARS]
+        # Back-track to last space so we don't cut a word in half
+        last_space = window_text.rfind(" ")
+        if last_space > _SNIPPET_MAX_CHARS // 2:
+            window_text = window_text[:last_space]
+        window_text += "…"
+
+    # Highlight matched terms with <mark> tags
+    highlighted = token_pattern.sub(r"<mark>\1</mark>", window_text)
+    return highlighted
+
+
+def _query_surface_tokens(q: str) -> List[str]:
+    """
+    Return tokens suitable for snippet highlighting.
+
+    We combine:
+    * Raw words from the query (split on whitespace, boolean operators removed)
+      — these match the surface form in the abstract.
+    * Preprocessed tokens from the NLP pipeline — catch stemmed variants.
+    """
+    # Remove boolean operators
+    cleaned = re.sub(r"\b(AND|OR|NOT)\b", " ", q, flags=re.IGNORECASE)
+    raw_words = [w for w in re.split(r"\s+", cleaned) if len(w) > 1]
+
+    try:
+        nlp_tokens = preprocess(q)
+    except Exception:
+        nlp_tokens = []
+
+    # Deduplicate while preserving order, prefer longer tokens first so the
+    # regex alternation matches them greedily.
+    seen: set = set()
+    combined = []
+    for tok in sorted(raw_words + nlp_tokens, key=len, reverse=True):
+        tl = tok.lower()
+        if tl not in seen and tl not in {"and", "or", "not"}:
+            seen.add(tl)
+            combined.append(tok)
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
 
-def _build_result(url: str, score: Optional[float], pub: Optional[dict]) -> PublicationResult:
+def _build_result(
+    url: str,
+    score: Optional[float],
+    pub: Optional[dict],
+    query_tokens: Optional[List[str]] = None,
+) -> PublicationResult:
     if pub is None:
         pub = {}
     authors = pub.get("authors", [])
     if isinstance(authors, str):
         authors = [a.strip() for a in authors.split(";") if a.strip()]
+
+    abstract = pub.get("abstract")
+
+    # REQ-B50: generate snippet only when query context is available
+    snippet: Optional[str] = None
+    if query_tokens is not None:
+        snippet = _extract_snippet(abstract or "", query_tokens)
+
     return PublicationResult(
         url=url,
         title=pub.get("title"),
         authors=authors or None,
-        abstract=pub.get("abstract"),
+        abstract=abstract,
+        snippet=snippet,
         date=pub.get("date") or pub.get("publication_date"),
         doi=pub.get("doi"),
         pdf_link=pub.get("pdf_link") or pub.get("pdf_url"),
@@ -180,9 +366,15 @@ def search(
 
     - `mode=custom` — implementação própria (TF × log(N/DF))
     - `mode=sklearn` — implementação via scikit-learn
+
+    Cada resultado inclui um **snippet** do abstract com os termos da query
+    destacados em `<mark>…</mark>` (REQ-B50).
     """
     if not INDEX:
         raise HTTPException(status_code=503, detail="Index not loaded. Run the indexer first.")
+
+    # REQ-B66: sanitize before any processing
+    q = sanitize_query(q)
 
     if mode == "custom":
         raw_results = get_custom_ranking(q, INDEX, max(len(PUBLICATIONS), 1))
@@ -196,7 +388,13 @@ def search(
 
     filtered_urls = _apply_filters(urls_ordered, year, doc_type)
     paginated = _paginate(filtered_urls, page, page_size)
-    results = [_build_result(url, scores.get(url), PUB_LOOKUP.get(url)) for url in paginated]
+
+    # REQ-B50: derive highlight tokens once for all results
+    highlight_tokens = _query_surface_tokens(q)
+    results = [
+        _build_result(url, scores.get(url), PUB_LOOKUP.get(url), highlight_tokens)
+        for url in paginated
+    ]
 
     return SearchResponse(
         query=q,
@@ -222,16 +420,28 @@ def search_boolean(
 
     - Termos separados por espaço são tratados como AND implícito.
     - Exemplo: `machine learning AND health NOT survey`
+
+    Cada resultado inclui um **snippet** do abstract com os termos da query
+    destacados em `<mark>…</mark>` (REQ-B50).
     """
     if not INDEX:
         raise HTTPException(status_code=503, detail="Index not loaded. Run the indexer first.")
+
+    # REQ-B66: sanitize before any processing
+    q = sanitize_query(q)
 
     matching_urls = execute_boolean_query(q, INDEX, ALL_DOC_IDS)
     urls_list = sorted(list(matching_urls))
 
     filtered = _apply_filters(urls_list, year, doc_type)
     paginated = _paginate(filtered, page, page_size)
-    results = [_build_result(url, None, PUB_LOOKUP.get(url)) for url in paginated]
+
+    # REQ-B50: highlight tokens (strip boolean operators for highlighting)
+    highlight_tokens = _query_surface_tokens(q)
+    results = [
+        _build_result(url, None, PUB_LOOKUP.get(url), highlight_tokens)
+        for url in paginated
+    ]
 
     return SearchResponse(
         query=q,
@@ -256,6 +466,9 @@ def search_author(
     if not PUBLICATIONS:
         raise HTTPException(status_code=503, detail="Publications data not available.")
 
+    # REQ-B66: basic sanitization for author name (no boolean operators needed)
+    name = sanitize_query(name)
+
     name_lower = name.lower()
     matched: List[PublicationResult] = []
 
@@ -264,6 +477,7 @@ def search_author(
         if isinstance(authors, str):
             authors = [a.strip() for a in authors.split(";")]
         if any(name_lower in (a or "").lower() for a in authors):
+            # No snippet for author search (no free-text query)
             matched.append(_build_result(pub.get("url", ""), None, pub))
 
     paginated = _paginate(matched, page, page_size)
@@ -355,6 +569,7 @@ def debug_preprocess(
         "tokens": tokens,
         "token_count": len(tokens),
     }
+
 
 if __name__ == "__main__":
     import uvicorn
