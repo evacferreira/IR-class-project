@@ -7,14 +7,16 @@ import json
 import os
 import re
 import unicodedata
+import xml.etree.ElementTree as ET
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from src.search.nlp import preprocess
-from src.search.query import execute_boolean_query
+from src.search.query import execute_boolean_query, execute_phrase_query, execute_proximity_query
 from src.search.tfidf import get_custom_ranking, get_sklearn_ranking
 
 # ---------------------------------------------------------------------------
@@ -25,10 +27,11 @@ app = FastAPI(
     title="RepositóriUM Search Engine",
     description=(
         "Motor de pesquisa de publicações científicas da Universidade do Minho. "
-        "Suporta pesquisa por texto livre (TF-IDF), pesquisa booleana (AND/OR/NOT) "
-        "e pesquisa por autor."
+        "Suporta pesquisa por texto livre (TF-IDF), pesquisa booleana (AND/OR/NOT), "
+        "pesquisa por frase, pesquisa por proximidade e pesquisa por autor. "
+        "Respostas em JSON e XML (REQ-B52)."
     ),
-    version="1.0.0",
+    version="2.0.0",
     contact={"name": "PRI — UMinho"},
 )
 
@@ -40,28 +43,24 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Data loading (loaded once at startup)
+# Data loading
 # ---------------------------------------------------------------------------
 
 INDEX_PATH = "data/index.json"
-PUBS_PATH = "data/scraper_results.json"
+PUBS_PATH  = "data/scraper_results.json"
 
 
 def _load_data():
     if not os.path.exists(INDEX_PATH):
         raise RuntimeError(f"Index not found at '{INDEX_PATH}'. Run the indexer first.")
-
     with open(INDEX_PATH, "r", encoding="utf-8") as f:
         index = json.load(f)
-
     publications: List[dict] = []
     if os.path.exists(PUBS_PATH):
         with open(PUBS_PATH, "r", encoding="utf-8") as f:
             publications = json.load(f)
-
     all_doc_ids = {p.get("url") for p in publications if p.get("url")}
-    pub_lookup = {p.get("url"): p for p in publications if p.get("url")}
-
+    pub_lookup  = {p.get("url"): p for p in publications if p.get("url")}
     return index, publications, all_doc_ids, pub_lookup
 
 
@@ -73,7 +72,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic response models
+# Pydantic models
 # ---------------------------------------------------------------------------
 
 class PublicationResult(BaseModel):
@@ -81,7 +80,6 @@ class PublicationResult(BaseModel):
     title: Optional[str] = None
     authors: Optional[List[str]] = None
     abstract: Optional[str] = None
-    # REQ-B50: snippet with highlighted query terms (HTML <mark> tags)
     snippet: Optional[str] = None
     date: Optional[str] = None
     doi: Optional[str] = None
@@ -107,173 +105,119 @@ class AuthorProfile(BaseModel):
 # REQ-B66 — Query sanitization
 # ---------------------------------------------------------------------------
 
-# Characters that have no place in a free-text or boolean query
 _FORBIDDEN_PATTERN = re.compile(r"[<>{}\[\]\\|`~@#$%^*]")
-
-# Collapse runs of the same boolean operator (e.g. "AND AND") to one
-_REPEATED_OPERATOR = re.compile(
-    r"\b(AND|OR|NOT)\b(?:\s+\b(?:AND|OR|NOT)\b)+", re.IGNORECASE
-)
-
-# Maximum accepted query length (characters)
-_MAX_QUERY_LEN = 512
+_REPEATED_OPERATOR = re.compile(r"\b(AND|OR|NOT)\b(?:\s+\b(?:AND|OR|NOT)\b)+", re.IGNORECASE)
+_MAX_QUERY_LEN     = 512
 
 
 def sanitize_query(raw: str) -> str:
-    """
-    REQ-B66 — Advanced query sanitization:
-
-    1. Reject (raise 400) if the query exceeds ``_MAX_QUERY_LEN`` characters.
-    2. Strip leading / trailing whitespace.
-    3. Normalise Unicode to NFC so accented characters are consistent.
-    4. Remove characters that are forbidden in a search context
-       (angle brackets, curly / square brackets, back-slash, pipe, back-tick,
-        and other shell / injection meta-characters).
-    5. Collapse multiple consecutive whitespace into a single space.
-    6. Collapse repeated boolean operators (e.g. ``AND AND``) to a single one.
-    7. Reject (raise 400) if the sanitized query is empty.
-
-    Returns the cleaned query string.
-    """
     if len(raw) > _MAX_QUERY_LEN:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Query too long: {len(raw)} characters "
-                f"(maximum allowed: {_MAX_QUERY_LEN})."
-            ),
+            detail=f"Query too long: {len(raw)} chars (max {_MAX_QUERY_LEN}).",
         )
-
-    q = raw.strip()
-
-    # Normalise Unicode (NFC: composed form)
-    q = unicodedata.normalize("NFC", q)
-
-    # Strip forbidden meta-characters
+    q = unicodedata.normalize("NFC", raw.strip())
     q = _FORBIDDEN_PATTERN.sub(" ", q)
-
-    # Collapse whitespace
     q = re.sub(r"\s+", " ", q).strip()
-
-    # Collapse repeated boolean operators: "AND AND" → "AND"
     q = _REPEATED_OPERATOR.sub(lambda m: m.group(1).upper(), q)
-
-    # Strip dangling leading/trailing operators
     q = re.sub(r"^(AND|OR|NOT)\s+", "", q, flags=re.IGNORECASE)
-    q = re.sub(r"\s+(AND|OR|NOT)$", "", q, flags=re.IGNORECASE)
-
-    q = q.strip()
+    q = re.sub(r"\s+(AND|OR|NOT)$", "", q, flags=re.IGNORECASE).strip()
     if not q:
-        raise HTTPException(
-            status_code=400,
-            detail="Query is empty after sanitization. Please provide a valid search term.",
-        )
-
+        raise HTTPException(status_code=400, detail="Query is empty after sanitization.")
     return q
 
 
 # ---------------------------------------------------------------------------
-# REQ-B50 — Snippet generation with term highlighting
+# REQ-B50 — Snippet generation
 # ---------------------------------------------------------------------------
 
-_SNIPPET_WINDOW = 40   # words on each side of the best-matching sentence
-_SNIPPET_MAX_CHARS = 300  # hard cap on final snippet length
+_SNIPPET_MAX_CHARS = 300
 
 
 def _extract_snippet(text: str, query_tokens: List[str]) -> Optional[str]:
-    """
-    REQ-B50 — Generate a short, relevant snippet from *text* that:
-
-    * Selects the sentence (or word window) with the highest density of
-      query-term matches.
-    * Wraps every matched term in ``<mark>…</mark>`` for front-end highlighting.
-    * Falls back to the first ``_SNIPPET_MAX_CHARS`` characters when no match
-      is found.
-
-    ``query_tokens`` should be the preprocessed (stemmed/lowercased) terms so
-    they align with how the index was built. We also do a raw case-insensitive
-    match against the original surface forms so the snippet stays readable.
-    """
     if not text:
         return None
-
-    # Build a regex that matches any of the query tokens (surface form, since
-    # the abstract is not preprocessed).  We try both the raw token and its
-    # unstemmed version by just doing a prefix match (word-boundary aware).
     if not query_tokens:
-        # No tokens → return the start of the abstract
         snippet = text[:_SNIPPET_MAX_CHARS]
         return snippet + ("…" if len(text) > _SNIPPET_MAX_CHARS else "")
 
-    # Pattern matches any query token at a word boundary (case-insensitive)
     token_pattern = re.compile(
         r"\b(" + "|".join(re.escape(t) for t in query_tokens) + r")\b",
         re.IGNORECASE,
     )
-
-    # Split into sentences (simple heuristic)
     sentences = re.split(r"(?<=[.!?])\s+", text)
-
-    best_sentence_idx = 0
-    best_count = -1
+    best_idx, best_count = 0, -1
     for i, sent in enumerate(sentences):
         count = len(token_pattern.findall(sent))
         if count > best_count:
-            best_count = count
-            best_sentence_idx = i
+            best_count, best_idx = count, i
 
-    # Take a window of sentences centred on the best one
-    start = max(0, best_sentence_idx - 1)
-    end = min(len(sentences), best_sentence_idx + 2)
-    window_text = " ".join(sentences[start:end])
+    start  = max(0, best_idx - 1)
+    end    = min(len(sentences), best_idx + 2)
+    window = " ".join(sentences[start:end])
 
-    # Truncate to character limit (cut at word boundary)
-    if len(window_text) > _SNIPPET_MAX_CHARS:
-        window_text = window_text[:_SNIPPET_MAX_CHARS]
-        # Back-track to last space so we don't cut a word in half
-        last_space = window_text.rfind(" ")
+    if len(window) > _SNIPPET_MAX_CHARS:
+        window     = window[:_SNIPPET_MAX_CHARS]
+        last_space = window.rfind(" ")
         if last_space > _SNIPPET_MAX_CHARS // 2:
-            window_text = window_text[:last_space]
-        window_text += "…"
+            window = window[:last_space]
+        window += "…"
 
-    # Highlight matched terms with <mark> tags
-    highlighted = token_pattern.sub(r"<mark>\1</mark>", window_text)
-    return highlighted
+    return token_pattern.sub(r"<mark>\1</mark>", window)
 
 
 def _query_surface_tokens(q: str) -> List[str]:
-    """
-    Return tokens suitable for snippet highlighting.
-
-    We combine:
-    * Raw words from the query (split on whitespace, boolean operators removed)
-      — these match the surface form in the abstract.
-    * Preprocessed tokens from the NLP pipeline — catch stemmed variants.
-    """
-    # Remove boolean operators
-    cleaned = re.sub(r"\b(AND|OR|NOT)\b", " ", q, flags=re.IGNORECASE)
+    cleaned   = re.sub(r"\b(AND|OR|NOT)\b", " ", q, flags=re.IGNORECASE)
     raw_words = [w for w in re.split(r"\s+", cleaned) if len(w) > 1]
-
     try:
         nlp_tokens = preprocess(q)
     except Exception:
         nlp_tokens = []
-
-    # Deduplicate while preserving order, prefer longer tokens first so the
-    # regex alternation matches them greedily.
     seen: set = set()
-    combined = []
+    combined  = []
     for tok in sorted(raw_words + nlp_tokens, key=len, reverse=True):
         tl = tok.lower()
         if tl not in seen and tl not in {"and", "or", "not"}:
             seen.add(tl)
             combined.append(tok)
-
     return combined
 
 
 # ---------------------------------------------------------------------------
-# Helper utilities
+# REQ-B52 — XML serialisation helpers
+# ---------------------------------------------------------------------------
+
+def _result_to_xml_elem(r: PublicationResult) -> ET.Element:
+    doc = ET.Element("document")
+    for field in ("url", "title", "date", "doi", "pdf_link", "score", "snippet", "abstract"):
+        val = getattr(r, field, None)
+        if val is not None:
+            ET.SubElement(doc, field).text = str(val)
+    if r.authors:
+        authors_el = ET.SubElement(doc, "authors")
+        for a in r.authors:
+            ET.SubElement(authors_el, "author").text = a
+    return doc
+
+
+def _search_response_to_xml(resp: SearchResponse) -> Response:
+    root = ET.Element("searchResponse")
+    ET.SubElement(root, "query").text    = resp.query
+    ET.SubElement(root, "total").text    = str(resp.total)
+    ET.SubElement(root, "page").text     = str(resp.page)
+    ET.SubElement(root, "pageSize").text = str(resp.page_size)
+    results_el = ET.SubElement(root, "results")
+    for r in resp.results:
+        results_el.append(_result_to_xml_elem(r))
+    xml_str = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    return Response(
+        content=f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_str}',
+        media_type="application/xml",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _build_result(
@@ -287,14 +231,8 @@ def _build_result(
     authors = pub.get("authors", [])
     if isinstance(authors, str):
         authors = [a.strip() for a in authors.split(";") if a.strip()]
-
     abstract = pub.get("abstract")
-
-    # REQ-B50: generate snippet only when query context is available
-    snippet: Optional[str] = None
-    if query_tokens is not None:
-        snippet = _extract_snippet(abstract or "", query_tokens)
-
+    snippet  = _extract_snippet(abstract or "", query_tokens) if query_tokens is not None else None
     return PublicationResult(
         url=url,
         title=pub.get("title"),
@@ -324,11 +262,23 @@ def _apply_filters(urls: List[str], year: Optional[int], doc_type: Optional[str]
             if str(year) not in pub_date:
                 continue
         if doc_type:
-            pub_type = str(pub.get("type", "")).lower()
-            if doc_type.lower() not in pub_type:
+            if doc_type.lower() not in str(pub.get("type", "")).lower():
                 continue
         filtered.append(url)
     return filtered
+
+
+def _parse_fields(fields: Optional[str]) -> Optional[List[str]]:
+    """Parse the ``fields`` query param into a list or None (= all fields)."""
+    if not fields:
+        return None
+    parsed = [f.strip() for f in fields.split(",") if f.strip() in ("title", "abstract")]
+    return parsed if parsed else None
+
+
+def _respond(resp: SearchResponse, fmt: str):
+    """Return a FastAPI-compatible JSON model or an XML Response."""
+    return _search_response_to_xml(resp) if fmt == "xml" else resp
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +287,7 @@ def _apply_filters(urls: List[str], year: Optional[int], doc_type: Optional[str]
 
 @app.get("/", tags=["Info"])
 def root():
-    """Health check / welcome endpoint."""
+    """Health check / welcome."""
     return {
         "message": "RepositóriUM Search Engine is running.",
         "docs": "/docs",
@@ -348,127 +298,180 @@ def root():
 
 # ── 1. Free-text search (TF-IDF) ───────────────────────────────────────────
 
-@app.get("/search", response_model=SearchResponse, tags=["Search"])
+@app.get("/search", tags=["Search"])
 def search(
     q: str = Query(..., description="Texto a pesquisar"),
     mode: str = Query(
         "custom",
-        description="Implementação TF-IDF: 'custom' (implementação própria) ou 'sklearn'",
+        description="'custom' (implementação própria) ou 'sklearn'",
         pattern="^(custom|sklearn)$",
     ),
-    year: Optional[int] = Query(None, description="Filtrar por ano de publicação"),
-    doc_type: Optional[str] = Query(None, description="Filtrar por tipo de documento"),
-    page: int = Query(1, ge=1, description="Número da página"),
-    page_size: int = Query(10, ge=1, le=100, description="Resultados por página"),
-):
-    """
-    **Pesquisa por texto livre** com ranking TF-IDF e similaridade do cosseno.
-
-    - `mode=custom` — implementação própria (TF × log(N/DF))
-    - `mode=sklearn` — implementação via scikit-learn
-
-    Cada resultado inclui um **snippet** do abstract com os termos da query
-    destacados em `<mark>…</mark>` (REQ-B50).
-    """
-    if not INDEX:
-        raise HTTPException(status_code=503, detail="Index not loaded. Run the indexer first.")
-
-    # REQ-B66: sanitize before any processing
-    q = sanitize_query(q)
-
-    if mode == "custom":
-        raw_results = get_custom_ranking(q, INDEX, max(len(PUBLICATIONS), 1))
-    else:
-        if not PUBLICATIONS:
-            raise HTTPException(status_code=503, detail="Publications data not available for sklearn mode.")
-        raw_results = get_sklearn_ranking(q, PUBLICATIONS)
-
-    urls_ordered = [url for url, _ in raw_results]
-    scores = {url: score for url, score in raw_results}
-
-    filtered_urls = _apply_filters(urls_ordered, year, doc_type)
-    paginated = _paginate(filtered_urls, page, page_size)
-
-    # REQ-B50: derive highlight tokens once for all results
-    highlight_tokens = _query_surface_tokens(q)
-    results = [
-        _build_result(url, scores.get(url), PUB_LOOKUP.get(url), highlight_tokens)
-        for url in paginated
-    ]
-
-    return SearchResponse(
-        query=q,
-        total=len(filtered_urls),
-        page=page,
-        page_size=page_size,
-        results=results,
-    )
-
-
-# ── 2. Boolean search ───────────────────────────────────────────────────────
-
-@app.get("/search/boolean", response_model=SearchResponse, tags=["Search"])
-def search_boolean(
-    q: str = Query(..., description="Query booleana (ex: 'machine learning AND health NOT survey')"),
+    fields: Optional[str] = Query(
+        None,
+        description="REQ-B46 — Restringir a 'title', 'abstract' ou 'title,abstract' (omitir = todos).",
+    ),
+    expand: bool = Query(False, description="REQ-B47 — Expandir termos com sinónimos WordNet."),
     year: Optional[int] = Query(None, description="Filtrar por ano de publicação"),
     doc_type: Optional[str] = Query(None, description="Filtrar por tipo de documento"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    format: str = Query("json", pattern="^(json|xml)$", description="REQ-B52 — 'json' ou 'xml'."),
 ):
     """
-    **Pesquisa booleana** com suporte a operadores AND, OR, NOT.
+    **Pesquisa por texto livre** com ranking TF-IDF.
 
-    - Termos separados por espaço são tratados como AND implícito.
-    - Exemplo: `machine learning AND health NOT survey`
-
-    Cada resultado inclui um **snippet** do abstract com os termos da query
-    destacados em `<mark>…</mark>` (REQ-B50).
+    Suporta filtragem por campo (`fields`), expansão de query (`expand`) e
+    resposta em JSON ou XML (`format`).
     """
     if not INDEX:
-        raise HTTPException(status_code=503, detail="Index not loaded. Run the indexer first.")
+        raise HTTPException(status_code=503, detail="Index not loaded.")
 
-    # REQ-B66: sanitize before any processing
-    q = sanitize_query(q)
+    q          = sanitize_query(q)
+    field_list = _parse_fields(fields)
 
-    matching_urls = execute_boolean_query(q, INDEX, ALL_DOC_IDS)
-    urls_list = sorted(list(matching_urls))
+    if mode == "custom":
+        raw_results = get_custom_ranking(q, INDEX, max(len(PUBLICATIONS), 1), fields=field_list, expand=expand)
+    else:
+        if not PUBLICATIONS:
+            raise HTTPException(status_code=503, detail="Publications data not available.")
+        raw_results = get_sklearn_ranking(q, PUBLICATIONS, fields=field_list)
 
-    filtered = _apply_filters(urls_list, year, doc_type)
-    paginated = _paginate(filtered, page, page_size)
+    urls_ordered = [url for url, _ in raw_results]
+    scores       = {url: score for url, score in raw_results}
+    filtered     = _apply_filters(urls_ordered, year, doc_type)
+    paginated    = _paginate(filtered, page, page_size)
+    hl_tokens    = _query_surface_tokens(q)
+    results      = [_build_result(url, scores.get(url), PUB_LOOKUP.get(url), hl_tokens) for url in paginated]
 
-    # REQ-B50: highlight tokens (strip boolean operators for highlighting)
-    highlight_tokens = _query_surface_tokens(q)
-    results = [
-        _build_result(url, None, PUB_LOOKUP.get(url), highlight_tokens)
-        for url in paginated
-    ]
-
-    return SearchResponse(
-        query=q,
-        total=len(filtered),
-        page=page,
-        page_size=page_size,
-        results=results,
-    )
+    resp = SearchResponse(query=q, total=len(filtered), page=page, page_size=page_size, results=results)
+    return _respond(resp, format)
 
 
-# ── 3. Author search ────────────────────────────────────────────────────────
+# ── 2. Boolean search ───────────────────────────────────────────────────────
+
+@app.get("/search/boolean", tags=["Search"])
+def search_boolean(
+    q: str = Query(..., description="Query booleana — AND / OR / NOT, parênteses, frases, NEAR/k"),
+    fields: Optional[str] = Query(None, description="REQ-B46 — 'title', 'abstract' ou ambos."),
+    expand: bool = Query(False, description="REQ-B47 — Expandir termos com sinónimos WordNet."),
+    year: Optional[int] = Query(None),
+    doc_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    format: str = Query("json", pattern="^(json|xml)$", description="REQ-B52 — 'json' ou 'xml'."),
+):
+    """
+    **Pesquisa booleana** — NOT > AND > OR (precedência correcta), parênteses,
+    frases ("…") e proximidade (word NEAR/k word) incluídos.
+    """
+    if not INDEX:
+        raise HTTPException(status_code=503, detail="Index not loaded.")
+
+    q          = sanitize_query(q)
+    field_list = _parse_fields(fields)
+
+    matching_urls = execute_boolean_query(q, INDEX, ALL_DOC_IDS, fields=field_list, expand=expand)
+    urls_list     = sorted(list(matching_urls))
+    filtered      = _apply_filters(urls_list, year, doc_type)
+    paginated     = _paginate(filtered, page, page_size)
+    hl_tokens     = _query_surface_tokens(q)
+    results       = [_build_result(url, None, PUB_LOOKUP.get(url), hl_tokens) for url in paginated]
+
+    resp = SearchResponse(query=q, total=len(filtered), page=page, page_size=page_size, results=results)
+    return _respond(resp, format)
+
+
+# ── 3. Phrase search ─────────────────────────────────────────────────────── REQ-B48
+
+@app.get("/search/phrase", tags=["Search"])
+def search_phrase(
+    q: str = Query(..., description='Frase exacta, ex: "deep learning"'),
+    fields: Optional[str] = Query(None, description="REQ-B46 — 'title', 'abstract' ou ambos."),
+    year: Optional[int] = Query(None),
+    doc_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    format: str = Query("json", pattern="^(json|xml)$", description="REQ-B52 — 'json' ou 'xml'."),
+):
+    """
+    **Pesquisa por frase exacta** (REQ-B48).
+
+    Os tokens devem aparecer consecutivos e na ordem correcta.
+    Requer índice com listas de posições (novo `indexer.py`).
+    """
+    if not INDEX:
+        raise HTTPException(status_code=503, detail="Index not loaded.")
+
+    q          = sanitize_query(q)
+    field_list = _parse_fields(fields)
+
+    matching_urls = execute_phrase_query(q, INDEX, field_list)
+    urls_list     = sorted(list(matching_urls))
+    filtered      = _apply_filters(urls_list, year, doc_type)
+    paginated     = _paginate(filtered, page, page_size)
+    hl_tokens     = _query_surface_tokens(q)
+    results       = [_build_result(url, None, PUB_LOOKUP.get(url), hl_tokens) for url in paginated]
+
+    resp = SearchResponse(query=q, total=len(filtered), page=page, page_size=page_size, results=results)
+    return _respond(resp, format)
+
+
+# ── 4. Proximity search ──────────────────────────────────────────────────── REQ-B48
+
+@app.get("/search/proximity", tags=["Search"])
+def search_proximity(
+    term1: str = Query(..., description="Primeiro termo"),
+    term2: str = Query(..., description="Segundo termo"),
+    distance: int = Query(5, ge=1, le=50, description="Distância máxima em tokens (NEAR/k)"),
+    fields: Optional[str] = Query(None, description="REQ-B46 — 'title', 'abstract' ou ambos."),
+    year: Optional[int] = Query(None),
+    doc_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    format: str = Query("json", pattern="^(json|xml)$", description="REQ-B52 — 'json' ou 'xml'."),
+):
+    """
+    **Pesquisa por proximidade** (REQ-B48) — `term1 NEAR/distance term2`.
+
+    Devolve documentos onde os dois termos estão a no máximo `distance`
+    posições de distância (em qualquer ordem).
+    Requer índice com listas de posições (novo `indexer.py`).
+    """
+    if not INDEX:
+        raise HTTPException(status_code=503, detail="Index not loaded.")
+
+    term1      = sanitize_query(term1)
+    term2      = sanitize_query(term2)
+    field_list = _parse_fields(fields)
+
+    matching_urls = execute_proximity_query(term1, term2, distance, INDEX, field_list)
+    urls_list     = sorted(list(matching_urls))
+    filtered      = _apply_filters(urls_list, year, doc_type)
+    paginated     = _paginate(filtered, page, page_size)
+    hl_tokens     = _query_surface_tokens(f"{term1} {term2}")
+    results       = [_build_result(url, None, PUB_LOOKUP.get(url), hl_tokens) for url in paginated]
+
+    query_str = f"{term1} NEAR/{distance} {term2}"
+    resp = SearchResponse(query=query_str, total=len(filtered), page=page, page_size=page_size, results=results)
+    return _respond(resp, format)
+
+
+# ── 5. Author search ─────────────────────────────────────────────────────── REQ-B53/54/55
 
 @app.get("/search/author", tags=["Search"])
 def search_author(
     name: str = Query(..., description="Nome do autor (pesquisa parcial, case-insensitive)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    format: str = Query("json", pattern="^(json|xml)$", description="REQ-B52 — 'json' ou 'xml'."),
 ):
     """
-    **Pesquisa por autor** com correspondência parcial (case-insensitive).
+    **Pesquisa por autor** com correspondência parcial case-insensitive. (REQ-B53/B54/B55)
     """
     if not PUBLICATIONS:
         raise HTTPException(status_code=503, detail="Publications data not available.")
 
-    # REQ-B66: basic sanitization for author name (no boolean operators needed)
-    name = sanitize_query(name)
-
+    name       = sanitize_query(name)
     name_lower = name.lower()
     matched: List[PublicationResult] = []
 
@@ -477,27 +480,39 @@ def search_author(
         if isinstance(authors, str):
             authors = [a.strip() for a in authors.split(";")]
         if any(name_lower in (a or "").lower() for a in authors):
-            # No snippet for author search (no free-text query)
             matched.append(_build_result(pub.get("url", ""), None, pub))
 
     paginated = _paginate(matched, page, page_size)
 
+    if format == "xml":
+        root = ET.Element("authorSearch")
+        ET.SubElement(root, "queryAuthor").text = name
+        ET.SubElement(root, "total").text       = str(len(matched))
+        ET.SubElement(root, "page").text        = str(page)
+        ET.SubElement(root, "pageSize").text    = str(page_size)
+        results_el = ET.SubElement(root, "results")
+        for r in paginated:
+            results_el.append(_result_to_xml_elem(r))
+        xml_str = ET.tostring(root, encoding="unicode")
+        return Response(
+            content=f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_str}',
+            media_type="application/xml",
+        )
+
     return {
         "query_author": name,
-        "total": len(matched),
-        "page": page,
-        "page_size": page_size,
-        "results": paginated,
+        "total":        len(matched),
+        "page":         page,
+        "page_size":    page_size,
+        "results":      paginated,
     }
 
 
-# ── 4. Author profile ───────────────────────────────────────────────────────
+# ── 6. Author profile ────────────────────────────────────────────────────── REQ-B55
 
 @app.get("/author/{author_name}", response_model=AuthorProfile, tags=["Authors"])
 def author_profile(author_name: str):
-    """
-    **Perfil de um autor** — lista todas as publicações associadas ao nome.
-    """
+    """**Perfil de um autor** — lista todas as publicações associadas. (REQ-B55)"""
     if not PUBLICATIONS:
         raise HTTPException(status_code=503, detail="Publications data not available.")
 
@@ -516,59 +531,41 @@ def author_profile(author_name: str):
     return AuthorProfile(name=author_name, total_publications=len(pubs), publications=pubs)
 
 
-# ── 5. Document detail ──────────────────────────────────────────────────────
+# ── 7. Document detail ──────────────────────────────────────────────────────
 
 @app.get("/document", response_model=PublicationResult, tags=["Documents"])
-def get_document(
-    url: str = Query(..., description="URL/handle do documento"),
-):
-    """
-    **Detalhes de um documento** a partir do seu URL.
-    """
+def get_document(url: str = Query(..., description="URL/handle do documento")):
+    """**Detalhes de um documento** a partir do seu URL."""
     pub = PUB_LOOKUP.get(url)
     if pub is None:
         raise HTTPException(status_code=404, detail="Document not found.")
     return _build_result(url, None, pub)
 
 
-# ── 6. Index stats ──────────────────────────────────────────────────────────
+# ── 8. Index stats ──────────────────────────────────────────────────────────
 
 @app.get("/stats", tags=["Info"])
 def stats():
-    """
-    **Estatísticas do índice** — número de termos, documentos e top 20 termos por DF.
-    """
+    """**Estatísticas do índice** — termos, documentos, top 20 por DF."""
     if not INDEX:
         raise HTTPException(status_code=503, detail="Index not loaded.")
-
     top_terms = sorted(INDEX.items(), key=lambda x: x[1]["df"], reverse=True)[:20]
-
     return {
-        "total_terms": len(INDEX),
-        "total_documents": len(ALL_DOC_IDS),
+        "total_terms":        len(INDEX),
+        "total_documents":    len(ALL_DOC_IDS),
         "top_20_terms_by_df": [
-            {"term": term, "document_frequency": data["df"]}
-            for term, data in top_terms
+            {"term": t, "document_frequency": d["df"]} for t, d in top_terms
         ],
     }
 
 
-# ── 7. NLP debug endpoint ───────────────────────────────────────────────────
+# ── 9. NLP debug ────────────────────────────────────────────────────────────
 
 @app.get("/debug/preprocess", tags=["Debug"])
-def debug_preprocess(
-    text: str = Query(..., description="Texto a pré-processar"),
-):
-    """
-    **Debug NLP** — mostra os tokens gerados pelo pipeline de pré-processamento.
-    Útil para perceber como os termos são indexados.
-    """
+def debug_preprocess(text: str = Query(..., description="Texto a pré-processar")):
+    """**Debug NLP** — tokens do pipeline de pré-processamento."""
     tokens = preprocess(text)
-    return {
-        "input": text,
-        "tokens": tokens,
-        "token_count": len(tokens),
-    }
+    return {"input": text, "tokens": tokens, "token_count": len(tokens)}
 
 
 if __name__ == "__main__":
