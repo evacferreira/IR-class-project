@@ -82,5 +82,11 @@ def build_index(json_path='data/scraper_results.json', output_path='data/index.j
     print(f"Success! {new_docs_count} new documents added to the index.")
     print(f"Final index saved at: {output_path}")
 
+    from src.database import init_db, insert_publications, save_index
+
+    init_db()
+    insert_publications(publications)
+    save_index(inverted_index)
+
 if __name__ == "__main__":
     build_index()

@@ -346,7 +346,7 @@ if __name__ == "__main__":
 
     BASE_URL = "https://repositorium.uminho.pt/search?f.entityType=Publication,equals"  # o teu URL
 
-    scraper = UMinhoDSpace8Scraper(base_url=BASE_URL, max_items=50)
+    scraper = UMinhoDSpace8Scraper(base_url=BASE_URL, max_items=20)
     results = scraper.scrape()
 
     os.makedirs("data", exist_ok=True)
